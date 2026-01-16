@@ -79,7 +79,7 @@ class ProcessBrandPromptAnalysis implements ShouldQueue
             );
 
             // Update the brand prompt with results
-            $this->brandPrompt->update([
+            $updateData = [
                 'ai_response' => $result['ai_response'],
                 'resources' => json_encode($result['resources']),
                 'sentiment' => $result['analysis']['sentiment'],
@@ -91,7 +91,18 @@ class ProcessBrandPromptAnalysis implements ShouldQueue
                 'analysis_error' => null, // Clear any previous error
                 'session_id' => $this->sessionId ?: $this->brandPrompt->session_id,
                 'ai_model_id' => $result['ai_model_id'] ?? null,
+            ];
+
+            Log::info('Updating brand prompt with analysis', [
+                'brand_prompt_id' => $this->brandPrompt->id,
+                'ai_model_id_to_save' => $updateData['ai_model_id'],
+                'result_ai_model_id' => $result['ai_model_id'] ?? 'NOT_SET',
             ]);
+
+            $this->brandPrompt->update($updateData);
+
+            // Verify the update
+            $this->brandPrompt->refresh();
 
             Log::info('Successfully completed brand prompt analysis', [
                 'brand_prompt_id' => $this->brandPrompt->id,
@@ -99,6 +110,7 @@ class ProcessBrandPromptAnalysis implements ShouldQueue
                 'position' => $result['analysis']['position'],
                 'visibility' => $result['analysis']['visibility'],
                 'resources_count' => count($result['resources']),
+                'ai_model_id_saved' => $this->brandPrompt->ai_model_id,
             ]);
 
         } catch (\Exception $e) {

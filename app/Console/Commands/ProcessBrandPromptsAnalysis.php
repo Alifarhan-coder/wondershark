@@ -65,6 +65,18 @@ class ProcessBrandPromptsAnalysis extends Command
             $this->info('Processing prompts for '.$brands->count().' brand(s): '.$brands->pluck('name')->implode(', '));
         }
 
+        // Get enabled AI models for distribution
+        $enabledModels = \App\Models\AiModel::where('is_enabled', true)->orderBy('name')->get();
+
+        if ($enabledModels->isEmpty()) {
+            $this->error('No enabled AI models found!');
+
+            return 1;
+        }
+
+        $this->info("Enabled AI Models ({$enabledModels->count()}): ".$enabledModels->pluck('name')->implode(', '));
+        $this->newLine();
+
         $totalJobs = 0;
         $progressBar = $this->output->createProgressBar($brands->count());
         $progressBar->start();
@@ -94,26 +106,99 @@ class ProcessBrandPromptsAnalysis extends Command
                 continue;
             }
 
-            foreach ($prompts as $prompt) {
-                // Skip if already analyzed and not forcing regeneration
-                if (! $forceRegenerate &&
-                    $prompt->analysis_completed_at &&
-                    $prompt->ai_response) {
-                    if ($verbose) {
-                        $this->line("  Skipping prompt #{$prompt->id} (already analyzed)");
-                    }
+            // Filter prompts that need analysis
+            $promptsToProcess = $prompts->filter(function ($prompt) use ($forceRegenerate) {
+                return $forceRegenerate || ! $prompt->analysis_completed_at || ! $prompt->ai_response;
+            })->values();
 
-                    continue;
+            if ($promptsToProcess->isEmpty()) {
+                $this->warn('  → All prompts already analyzed (use --force to re-analyze)');
+                $progressBar->advance();
+
+                continue;
+            }
+
+            $totalPrompts = $promptsToProcess->count();
+
+            // Calculate weighted distribution using Largest Remainder Method (Hamilton's method)
+            $totalWeight = $enabledModels->sum('order');
+            $modelAssignments = [];
+            $fractionalParts = [];
+
+            // Step 1: Calculate ideal fractional assignments
+            foreach ($enabledModels as $model) {
+                $weight = $model->order ?? 1;
+                $idealAssignment = ($weight / $totalWeight) * $totalPrompts;
+                $baseAssignment = (int) floor($idealAssignment);
+                $fractional = $idealAssignment - $baseAssignment;
+
+                $modelAssignments[$model->id] = [
+                    'model' => $model,
+                    'base' => $baseAssignment,
+                    'fractional' => $fractional,
+                    'final' => $baseAssignment,
+                ];
+                $fractionalParts[$model->id] = $fractional;
+            }
+
+            // Step 2: Distribute remaining prompts to models with largest fractional parts
+            $assignedTotal = array_sum(array_column($modelAssignments, 'base'));
+            $remaining = $totalPrompts - $assignedTotal;
+
+            if ($remaining > 0) {
+                // Sort by fractional part descending
+                arsort($fractionalParts);
+                $topModels = array_slice(array_keys($fractionalParts), 0, $remaining, true);
+
+                foreach ($topModels as $modelId) {
+                    $modelAssignments[$modelId]['final']++;
                 }
+            }
+
+            // Show weights and distribution plan
+            $this->line('  AI Model Weights:');
+            foreach ($modelAssignments as $assignment) {
+                $weight = $assignment['model']->order ?? 1;
+                $percentage = round(($weight / $totalWeight) * 100, 1);
+                $this->line("    - {$assignment['model']->name}: weight={$weight} ({$percentage}%) → {$assignment['final']} prompts");
+            }
+
+            // Step 3: Assign prompts to models based on calculated distribution
+            $modelQueue = [];
+            foreach ($modelAssignments as $assignment) {
+                for ($i = 0; $i < $assignment['final']; $i++) {
+                    $modelQueue[] = $assignment['model'];
+                }
+            }
+
+            // Shuffle to avoid always assigning same models to first/last prompts
+            shuffle($modelQueue);
+
+            $modelDistribution = [];
+            foreach ($promptsToProcess as $index => $prompt) {
+                $assignedModel = $modelQueue[$index];
+
+                // Track distribution for reporting
+                if (! isset($modelDistribution[$assignedModel->name])) {
+                    $modelDistribution[$assignedModel->name] = 0;
+                }
+                $modelDistribution[$assignedModel->name]++;
 
                 if ($verbose) {
-                    $this->line("  Queueing prompt #{$prompt->id}: ".substr($prompt->prompt, 0, 50).'...');
+                    $this->line("  Queueing prompt #{$prompt->id} → {$assignedModel->name}: ".substr($prompt->prompt, 0, 50).'...');
                 }
 
-                ProcessBrandPromptAnalysis::dispatch($prompt, $sessionId, $forceRegenerate)
+                // Dispatch with assigned model
+                ProcessBrandPromptAnalysis::dispatch($prompt, $sessionId, $forceRegenerate, $assignedModel->name)
                     ->onQueue('default');
 
                 $totalJobs++;
+            }
+
+            // Verify distribution matches calculation
+            $this->line('  Actual Distribution:');
+            foreach ($modelDistribution as $modelName => $count) {
+                $this->line("    - {$modelName}: {$count} prompts");
             }
 
             $progressBar->advance();

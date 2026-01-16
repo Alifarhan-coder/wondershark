@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\AiModel;
+use App\Models\AiModelUsage;
 use App\Models\Brand;
 use App\Models\BrandPrompt;
 use App\Models\BrandPromptResource;
@@ -28,11 +29,13 @@ class BrandPromptAnalysisService
     public function analyzePrompt(BrandPrompt $brandPrompt, Brand $brand, ?string $preferredModelName = null, ?string $sessionId = null): array
     {
         $competitors = $brand->competitors()->pluck('name')->toArray();
+        $subreddits = $brand->subreddits()->pluck('subreddit_name')->toArray();
 
         Log::info('Analyzing brand prompt', [
             'brand_prompt_id' => $brandPrompt->id,
             'brand_name' => $brand->name,
             'competitors_count' => count($competitors),
+            'subreddits_count' => count($subreddits),
             'preferred_model' => $preferredModelName,
             'session_id' => $sessionId,
         ]);
@@ -41,7 +44,8 @@ class BrandPromptAnalysisService
         $enhancedPrompt = $this->buildAnalysisPrompt(
             $brand->name,
             $competitors,
-            $brandPrompt->prompt
+            $brandPrompt->prompt,
+            $subreddits
         );
 
         // Get AI response with preferred model and session-based distribution
@@ -50,26 +54,41 @@ class BrandPromptAnalysisService
         // Parse the response to extract resources and analysis
         $parsedResponse = $this->parseAIResponse($aiResponseData['text'], $brand, $competitors, $brandPrompt);
 
-        return [
+        $result = [
             'ai_response' => $parsedResponse['html_response'],
             'resources' => $parsedResponse['resources'],
             'analysis' => $parsedResponse['analysis'],
-            'ai_model_id' => $aiResponseData['ai_model_id'],
+            'ai_model_id' => $aiResponseData['ai_model_id'] ?? null,
         ];
+
+        Log::info('Analysis result prepared', [
+            'brand_prompt_id' => $brandPrompt->id,
+            'ai_model_id' => $result['ai_model_id'],
+            'has_ai_model_id' => isset($result['ai_model_id']),
+        ]);
+
+        return $result;
     }
 
     /**
      * Build the analysis prompt using the template provided
      */
-    protected function buildAnalysisPrompt(string $brandName, array $competitors, string $phrase): string
+    protected function buildAnalysisPrompt(string $brandName, array $competitors, string $phrase, array $subreddits = []): string
     {
         $competitorsString = implode(', ', $competitors);
+        $subredditsString = ! empty($subreddits) ? implode(', ', array_map(fn ($s) => "r/{$s}", $subreddits)) : '';
+
+        $additionalContext = '';
+        if (! empty($subreddits)) {
+            $additionalContext .= "\n\nIMPORTANT: When providing resources, you MUST include relevant Reddit posts/discussions from these target subreddits: {$subredditsString}. Include URLs to Reddit threads that discuss topics related to [{$phrase}] in these communities.";
+        }
 
         return "Given a brand [{$brandName}], a comma-separated list of competitors [{$competitorsString}], and a single phrase [{$phrase}], generate two outputs:
 
             1. An AI-generated response to the [{$phrase}] in HTML format, simulating a natural, informative answer that mentions [{$brandName}] and [{$competitorsString}] as relevant players in the context of the phrase.
 
             2. A detailed analysis with resources categorized by type.
+            {$additionalContext}
 
             Please structure your response as follows:
 
@@ -80,9 +99,11 @@ class BrandPromptAnalysisService
             ANALYSIS_START
             Resources: [Provide a detailed list of resources with the following format for each:
             - URL: [full URL]
-            - Type: [competitor_website|industry_report|news_article|documentation|blog_post|research_paper|social_media|marketplace|review_site|other]
+            - Type: [competitor_website|industry_report|news_article|documentation|blog_post|research_paper|social_media|reddit|youtube|marketplace|review_site|other]
             - Title: [resource title]
             - Description: [brief description of what this resource contains]
+            
+            IMPORTANT: Include Reddit URLs (from reddit.com) and YouTube URLs (from youtube.com) when relevant to the topic. For Reddit, prioritize the target subreddits mentioned above if provided.
             ]
             
             Brand_Sentiment: [Positive/Neutral/Negative with score 1-10]
@@ -99,6 +120,12 @@ class BrandPromptAnalysisService
     {
         try {
             $aiModel = null;
+
+            Log::info('Generate AI Response called', [
+                'preferred_model_name' => $preferredModelName,
+                'session_id' => $sessionId ? substr($sessionId, 0, 8) : null,
+                'has_distribution_service' => isset($this->distributionService),
+            ]);
 
             // If a preferred model is specified, try to use it first
             if ($preferredModelName) {
@@ -127,6 +154,10 @@ class BrandPromptAnalysisService
 
             // If no preferred model or it wasn't found, use weighted distribution service
             if (! $aiModel) {
+                Log::info('Attempting to get model from distribution service', [
+                    'session_id' => $sessionId ? substr($sessionId, 0, 8) : 'none',
+                ]);
+
                 $aiModel = $this->distributionService->getNextModel(
                     AiModelDistributionService::STRATEGY_WEIGHTED,
                     $sessionId
@@ -136,8 +167,13 @@ class BrandPromptAnalysisService
                     Log::info('Using weighted distribution AI model', [
                         'model_name' => $aiModel->name,
                         'display_name' => $aiModel->display_name,
+                        'model_id' => $aiModel->id,
                         'order' => $aiModel->order,
                         'session_id' => substr($sessionId ?? 'none', 0, 8),
+                    ]);
+                } else {
+                    Log::error('Distribution service returned null model', [
+                        'session_id' => $sessionId ? substr($sessionId, 0, 8) : 'none',
                     ]);
                 }
             }
@@ -153,6 +189,21 @@ class BrandPromptAnalysisService
             ]);
 
             $response = $this->callAiProvider($aiModel, $prompt);
+
+            // Track AI model usage
+            if ($sessionId) {
+                AiModelUsage::incrementUsage(
+                    $aiModel->id,
+                    $sessionId,
+                    'brand_prompt_analysis',
+                    null
+                );
+
+                Log::info('AI model usage tracked', [
+                    'ai_model_id' => $aiModel->id,
+                    'session_id' => substr($sessionId, 0, 8),
+                ]);
+            }
 
             return [
                 'text' => $response->text,
@@ -1015,6 +1066,15 @@ class BrandPromptAnalysisService
         $domain = parse_url($url, PHP_URL_HOST);
         $isCompetitorUrl = $this->isCompetitorUrl($url, $domain, $competitors);
 
+        // Auto-detect Reddit and YouTube URLs if not already categorized
+        if ($type === 'other' || $type === 'social_media' || $type === 'social') {
+            if ($domain && (strpos($domain, 'reddit.com') !== false || strpos($domain, 'redd.it') !== false)) {
+                $type = 'reddit';
+            } elseif ($domain && (strpos($domain, 'youtube.com') !== false || strpos($domain, 'youtu.be') !== false)) {
+                $type = 'youtube';
+            }
+        }
+
         return [
             'brand_prompt_id' => $brandPrompt->id,
             'url' => $url,
@@ -1076,6 +1136,8 @@ class BrandPromptAnalysisService
             'research' => 'research',
             'social_media' => 'social',
             'social' => 'social',
+            'reddit' => 'reddit',
+            'youtube' => 'youtube',
             'marketplace' => 'marketplace',
             'review_site' => 'reviews',
             'reviews' => 'reviews',

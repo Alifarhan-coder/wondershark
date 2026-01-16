@@ -51,9 +51,31 @@ Route::middleware(['auth', 'verified'])->group(function () {
         ->name('dashboard')
         ->middleware('role.permission:view-dashboard');
 
-    // Docs & Files Route
+    // Docs & Files Routes
     Route::get('docs-files', [\App\Http\Controllers\DocsFileController::class, 'index'])
         ->name('docs-files.index');
+    Route::post('docs-files', [\App\Http\Controllers\DocsFileController::class, 'store'])
+        ->name('docs-files.store');
+    Route::get('docs-files/folders', [\App\Http\Controllers\DocsFileController::class, 'getFolders'])
+        ->name('docs-files.folders.index');
+    Route::put('docs-files/{file}/move', [\App\Http\Controllers\DocsFileController::class, 'move'])
+        ->name('docs-files.move');
+    Route::post('docs-files/{file}/copy', [\App\Http\Controllers\DocsFileController::class, 'copy'])
+        ->name('docs-files.copy');
+    Route::delete('docs-files/{file}', [\App\Http\Controllers\DocsFileController::class, 'destroy'])
+        ->name('docs-files.destroy');
+    Route::post('docs-files/folders', [\App\Http\Controllers\DocsFileController::class, 'storeFolder'])
+        ->name('docs-files.folders.store');
+    Route::put('docs-files/folders/{folder}', [\App\Http\Controllers\DocsFileController::class, 'updateFolder'])
+        ->name('docs-files.folders.update');
+    Route::put('docs-files/folders/{folder}/move', [\App\Http\Controllers\DocsFileController::class, 'moveFolder'])
+        ->name('docs-files.folders.move');
+    Route::post('docs-files/folders/{folder}/copy', [\App\Http\Controllers\DocsFileController::class, 'copyFolder'])
+        ->name('docs-files.folders.copy');
+    Route::delete('docs-files/folders/{folder}', [\App\Http\Controllers\DocsFileController::class, 'destroyFolder'])
+        ->name('docs-files.folders.destroy');
+    Route::get('docs-files/folders/{folder}/download', [\App\Http\Controllers\DocsFileController::class, 'downloadFolder'])
+        ->name('docs-files.folders.download');
 
     // Brand-specific dashboard
     Route::get('brands/{brand}/dashboard', [\App\Http\Controllers\BrandController::class, 'dashboard'])
